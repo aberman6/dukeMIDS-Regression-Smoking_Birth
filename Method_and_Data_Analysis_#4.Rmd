@@ -1,0 +1,739 @@
+---
+title: 'Methods and Data Analysis #4'
+author: "Anna Berman"
+date: "10/11/2018"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = NA, fig.align = 'center')
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(arm)
+library(MASS)
+library(pROC)
+library(kableExtra)
+setwd('/Users/annaberman/Desktop/702 Modeling/Assignments/Methods and Data Analysis 4')
+```
+
+## Introduction
+
+The following report analyzes a subset of the Child Health and Development Studies, a comprehensive study of all babies born between 1960 and 1967 at the Kaiser Foundation Hospital in Oakland, CA. Broadly, our analysis is focused on the relationship between smoking and birth weight. Specifically, our interests are three-fold:
+
+1. Do mothers who smoke tend to have higher chances of pre-term birth than mothers who do not smoke? What is a likely range for the difference in odds of pre-term birth for smokers and non-smokers?
+2. Is there any evidence that the association between smoking and pre-term birth differs by mother's race? If so, characterize those differences.
+3. Are there other interesting associations with the odds of pre-term birth that are worth mentioning?
+
+## Data Overview
+
+The original Child Heath and Development Studies included 15,000 families, however our subset of data includes observations of 1,236 male single births where the baby lived at least 28 days. 
+
+Our data is further subset to exclude observations with missing values. Based on the results of our exploratory analysis and model fitting, we removed observations that are missing values for either our outcome or our final predictors. A summary of the remaining dataset is below:
+
+```{r}
+# Import dataset to be cleaned
+smoke_NA <- read.csv('babiesdata.csv')
+
+# Data cleaning
+smoke <- smoke_NA %>%
+    # Id and date is not relevent for this analysis
+    # Time is not relevent for these observations (all or none)
+    # Gestation and birthweight are bivariate predictors of our outcome Premature
+    # Remove dht and dwt for too many missing variables
+    dplyr::select(-id, -date, -time, -gestation, -bwt.oz, -number, -dht, -dwt) %>%
+    # Remove NA observations for variables in our model
+    filter(!is.na(Premature),
+           !is.na(smoke),
+           !is.na(mrace),
+           mrace != 10,
+           !is.na(mht),
+           !is.na(mpregwt),
+           !is.na(parity),
+           !is.na(inc),
+           !is.na(marital),
+           !is.na(med),
+           med < 6,
+           !is.na(mage)) %>%
+    # Make smoke a factor
+    mutate(smoke = factor(smoke, levels = c('0', '1'))) %>%
+    # Make mother's race a factor
+    mutate(mraceF = ifelse(mrace < 6, 'white',
+                           ifelse(mrace == 6, 'mexican', 
+                                  ifelse(mrace == 7, 'black', 
+                                         ifelse(mrace == 8, 'asian', 'mix'))))) %>%
+    mutate(mraceF = factor(mraceF, levels = c('white', 'black', 'mexican', 
+                                              'asian', 'mix'))) %>%
+    # Make mother's race a factor with collapsed baseline with white and mixed
+    mutate(mraceF2 = ifelse((mrace < 6 | mrace == 9), 'white or mixed',
+                           ifelse(mrace == 6, 'mexican', 
+                                  ifelse(mrace == 7, 'black', 
+                                         ifelse(mrace == 8, 'asian', 'error'))))) %>%
+    mutate(mraceF2 = factor(mraceF2, levels = c('white or mixed', 'black', 'mexican', 
+                                              'asian'))) %>%
+    # Mean center the numerical predictors except parity
+    mutate(mpregwtC = mpregwt - mean(mpregwt),
+           mhtC = mht - mean(mht),
+           mageC = mage - mean(mage),
+           incC = inc - median(inc)) %>%
+    # Make med a factor
+    mutate(medF = ifelse(med == 0, '< 8th grade',
+                         ifelse(med == 1, '8-12 grade',
+                                ifelse(med == 2, 'HS only',
+                                       ifelse(med == 3, 'HS + trade',
+                                              ifelse(med == 4, 'HS + some college',
+                                                     ifelse(med ==5, 'college',
+                                                            'error'))))))) %>%
+    # One copy of the med variable for plotting
+    mutate(medF = factor(medF, levels = c('< 8th grade', '8-12 grade', 'HS only', 
+                                          'HS + trade', 'HS + some college',
+                                          'college'))) %>%
+    # A second copy of the med variable rebased with HS only
+    mutate(medF2 = factor(medF, levels = c('HS only', '< 8th grade', '8-12 grade',
+                                          'HS + trade', 'HS + some college',
+                                          'college'))) %>%
+    # Binned med
+    mutate(med_bin = ifelse(med < 2, '< HS',
+                             ifelse(med == 2, 'HS only',
+                                    ifelse(med == 3 | med == 4, 'HS + trade or some college',
+                                           'college')))) %>%
+    # One copy of the med_bin variable for plotting
+    mutate(med_binF = factor(med_bin, levels = c('< HS', 'HS only',
+                                          'HS + trade or some college','college'))) %>%
+    # A second copy of the med_bin variable rebased with HS only
+    mutate(med_binF2 = factor(med_binF, levels = c('HS only', '< HS',
+                                          'HS + trade or some college','college'))) %>%
+    # Binned parity
+    mutate(parity2 = ifelse(parity < 7, '< 7', '7+')) %>%
+    mutate(parity2 = as.factor(parity2)) %>%
+    # Binned marital
+    mutate(marital2 = ifelse(marital == 1, 'married', 'unmarried')) %>%
+    mutate(marital2 = as.factor(marital2)) %>%
+    # Income factor
+    mutate(incCF = factor(incC, levels = c(0, -1, -2, -3, 1, 2, 3, 4, 5, 6)))
+
+
+summary(smoke)
+```
+
+### Mother's Race
+
+Before fitting our model, we altered our Mother's race variable. Given our research question, "Is there any evidence that the association between smoking and pre-term birth differs by mother's race?" fitting a model with interaction effects between smoke and mother's race is critical. However, when these interaction effects were introduced to our model we saw enormous increases in standard errors around the coefficients for mixed race variables. Upon closer examination we see that only `r sum(smoke$mraceF == 'mix')` mother's in our dataset are mixed race. Furthermore, `r prop.table(table(smoke[smoke$smoke == 0, 'mraceF'], smoke[smoke$smoke == 0,'Premature']),1)[5, 1]*100`% of mixed race non-smokers had regular term babies and `r round(prop.table(table(smoke[smoke$smoke == 1, 'mraceF'], smoke[smoke$smoke == 1,'Premature']),1)[5, 2]*100,1)`% of mixed race smokers had premature babies. 
+
+Given this distribution, we collapsed our mixed race mother's with the baseline (white mother's). The collapse version of mother's race variable is used throughout our analysis.
+
+```{r mixed_race, echo = FALSE}
+# Comparing premature rates for smoking and non-smoking mothers by race
+
+# Unaltered variable
+# Only 20 mixed race mothers on our dataset (2% of observations)
+n <- table(smoke$mraceF)
+
+# Non-smokers
+mrace_t2 <- prop.table(table(smoke[smoke$smoke == 0, 'mraceF'], 
+                             smoke[smoke$smoke == 0,'Premature']),1)
+rownames(mrace_t2) <- rownames(n)
+colnames(mrace_t2) <- c('Normal Term', 'Premature')
+                                                                                            
+# Smokers
+mrace_t3 <- prop.table(table(smoke[smoke$smoke == 1, 'mraceF'], 
+                             smoke[smoke$smoke == 1,'Premature']),1)
+colnames(mrace_t3) <- c('Normal Term', 'Premature')
+
+# Print table
+cbind(n, round(mrace_t2,2), round(mrace_t3,2)) %>%
+    kable()  %>%
+    add_header_above(c('Mother\'s Race (Unaltered)' = 1, ' ' = 1, 'Non-smoking' = 2, 
+                       'Smoking' = 2))
+
+# Altered variable
+n <- table(smoke$mraceF2)
+
+# Non-smokers
+mrace_t2 <- prop.table(table(smoke[smoke$smoke == 0, 'mraceF2'], 
+                             smoke[smoke$smoke == 0,'Premature']),1)
+rownames(mrace_t2) <- rownames(n)
+colnames(mrace_t2) <- c('Normal Term', 'Premature')
+                                                                                            
+# Smokers
+mrace_t3 <- prop.table(table(smoke[smoke$smoke == 1, 'mraceF2'], 
+                             smoke[smoke$smoke == 1,'Premature']),1)
+colnames(mrace_t3) <- c('Normal Term', 'Premature')
+
+# Print table
+cbind(n, round(mrace_t2,2), round(mrace_t3,2)) %>%
+    kable()  %>%
+    add_header_above(c('Mother\'s Race (Altered)' = 1, ' ' = 1, 'Non-smoking' = 2, 
+                       'Smoking' = 2))
+
+```
+
+#### Mother's Education
+
+We also chose to collapse mother's education. Primarily due to low sample sizes, we chose to collapse less than 8th grade education and 8-12th grade education - all levels of education less than completion of high school as well as collapse all education beyond high school without completing college.
+
+```{r education, echo = FALSE}
+# Comparing premature rates for smoking and non-smoking mothers by education
+# Unaltered variable
+# Only 14 mothers with < 8th grade education on our dataset (1.5% of observations)
+n <- table(smoke$med) 
+rownames(n) <- c('< 8th grade', '8-12 grade', 'HS only', 'HS + trade', 
+                 'HS + some college', 'college')
+
+# Non-smokers
+med_t2 <- prop.table(table(smoke[smoke$smoke == 0, 'med'], 
+                           smoke[smoke$smoke == 0,'Premature']),1)
+rownames(med_t2) <- c('< 8th grade', '8-12 grade', 'HS only', 'HS + trade', 
+                      'HS + some college', 'college')
+colnames(med_t2) <- c('Normal Term', 'Premature')
+
+# Smokers
+med_t3 <- prop.table(table(smoke[smoke$smoke == 1, 'med'], 
+                           smoke[smoke$smoke == 1,'Premature']),1)
+colnames(med_t3) <- c('Normal Term', 'Premature')
+
+# Print table
+cbind(n, round(med_t2,2), round(med_t3,2)) %>%
+    kable()  %>%
+    add_header_above(c('Mother\'s Education (Unaltered)' = 1, ' ' = 1, 'Non-smoking' = 2, 
+                       'Smoking' = 2))
+
+# Altered variable
+n <- table(smoke$med_binF) 
+rownames(n) <- c('< HS', 'HS only', 'HS + trade or some college', 'college')
+
+# Non-smokers
+med_t2 <- prop.table(table(smoke[smoke$smoke == 0, 'med_binF'], 
+                           smoke[smoke$smoke == 0,'Premature']),1)
+colnames(med_t2) <- c('Normal Term', 'Premature')
+
+# Smokers
+med_t3 <- prop.table(table(smoke[smoke$smoke == 1, 'med_binF'], 
+                           smoke[smoke$smoke == 1,'Premature']),1)
+colnames(med_t3) <- c('Normal Term', 'Premature')
+
+# Print table
+cbind(n, round(med_t2,2), round(med_t3,2)) %>%
+    kable()  %>%
+    add_header_above(c('Mother\'s Education (Altered)' = 1, ' ' = 1, 'Non-smoking' = 2, 
+                       'Smoking' = 2))
+```
+
+### Parity
+
+As seen in our exploratory analysis, the effects of parity on pre-term birth are prominent when comparing mothers with parity 0-6 and mothers with parity 7+. Therefore we chose to collapse parity into two categories.
+
+```{r parity, echo = FALSE, message = FALSE}
+# Comparing premature rates for smoking and non-smoking mothers by education
+# Unaltered variable
+# Only 14 mothers with < 8th grade education on our dataset (1.5% of observations)
+n <- table(smoke$parity) 
+rownames(n) <- seq(0,11)
+
+# Non-smokers
+par_t2 <- prop.table(table(smoke[smoke$smoke == 0, 'parity'], 
+                           smoke[smoke$smoke == 0,'Premature']),1)
+colnames(par_t2) <- c('Normal Term', 'Premature')
+
+# Smokers
+par_t3 <- prop.table(table(smoke[smoke$smoke == 1, 'parity'], 
+                           smoke[smoke$smoke == 1,'Premature']),1)
+colnames(par_t3) <- c('Normal Term', 'Premature')
+
+# Print table
+cbind(n, round(par_t2,2), round(par_t3,2)) %>%
+    kable()  %>%
+    add_header_above(c('Parity (Unaltered)' = 1, ' ' = 1, 'Non-smoking' = 2, 
+                       'Smoking' = 2))
+
+# Altered variable
+n <- table(smoke$parity2) 
+rownames(n) <- c('<7', '7+')
+
+# Non-smokers
+par_t2 <- prop.table(table(smoke[smoke$smoke == 0, 'parity2'], 
+                           smoke[smoke$smoke == 0,'Premature']),1)
+colnames(par_t2) <- c('Normal Term', 'Premature')
+
+# Smokers
+par_t3 <- prop.table(table(smoke[smoke$smoke == 1, 'parity2'], 
+                           smoke[smoke$smoke == 1,'Premature']),1)
+colnames(par_t3) <- c('Normal Term', 'Premature')
+
+# Print table
+cbind(n, round(par_t2,2), round(par_t3,2)) %>%
+    kable()  %>%
+    add_header_above(c('Parity (Altered)' = 1, ' ' = 1, 'Non-smoking' = 2, 
+                       'Smoking' = 2))
+```
+
+### Marital
+
+As seen in our exploratory analysis, there very few observations representing any marital status other than married. For this reason, we chose to collapse marital status into two categories - married and unmarried.
+
+```{r marital, echo = FALSE}
+# Comparing premature rates for smoking and non-smoking mothers by education
+# Unaltered variable
+# Only 14 mothers with < 8th grade education on our dataset (1.5% of observations)
+n <- table(smoke$marital) 
+rownames(n) <- c('legally seperated', 'married', 'divorced', 
+                 'widowed', 'never married')
+
+# Non-smokers
+mar_t2 <- prop.table(table(smoke[smoke$smoke == 0, 'marital'], 
+                           smoke[smoke$smoke == 0,'Premature']),1)
+colnames(mar_t2) <- c('Normal Term', 'Premature')
+
+# Smokers
+mar_t3 <- rbind(c(0,0),
+                prop.table(table(smoke[smoke$smoke == 1, 'marital'], 
+                           smoke[smoke$smoke == 1,'Premature']),1))
+colnames(mar_t3) <- c('Normal Term', 'Premature')
+
+# Print table
+cbind(n, round(mar_t2,2), round(mar_t3,2)) %>%
+    kable()  %>%
+    add_header_above(c('Marital (Unaltered)' = 1, ' ' = 1, 'Non-smoking' = 2, 
+                       'Smoking' = 2))
+
+# Altered variable
+n <- table(smoke$marital2) 
+rownames(n) <- c('married', 'unmarried')
+
+# Non-smokers
+mar_t2 <- prop.table(table(smoke[smoke$smoke == 0, 'marital2'], 
+                           smoke[smoke$smoke == 0,'Premature']),1)
+colnames(mar_t2) <- c('Normal Term', 'Premature')
+
+# Smokers
+mar_t3 <- prop.table(table(smoke[smoke$smoke == 1, 'marital2'], 
+                           smoke[smoke$smoke == 1,'Premature']),1)
+colnames(mar_t3) <- c('Normal Term', 'Premature')
+
+# Print table
+cbind(n, round(mar_t2,2), round(mar_t3,2)) %>%
+    kable()  %>%
+    add_header_above(c('Marital (Altered)' = 1, ' ' = 1, 'Non-smoking' = 2, 
+                       'Smoking' = 2))
+```
+
+## Exploratory Analysis
+
+### Marginal Plots
+
+Given our research questions, we select pre-term birth (Premature) as our outcome variable and smoking (smoke) as our first predictor variable. Understanding that the relationship between premature birth and smoking might be mediated by other variables, we start examining the relationship between prematurity and other variables that are not also bivariate predictors of premature birth (as are gestational age and birth weight).
+
+```{r explore, fig.height=8}
+# CATEGORICAL VARIABLES
+# Comparing mean proportion of premature births
+
+# SMOKE
+# Does seem to be an association with smoking and pre-term birth
+smoke_t <- tapply(smoke$Premature, smoke$smoke, mean)
+names(smoke_t) <- c('Non-smoking', 'Smoking')
+smoke_t 
+
+# MRACE
+# Baseline seems to be lower risk than minorities
+tapply(smoke$Premature, smoke$mraceF2, mean)
+
+# MED
+# Potentially negative association with increased education
+tapply(smoke$Premature, smoke$med_binF, mean)
+
+# MARITAL
+# Seems to be an association between unmarried and pre-term
+marital_t <- tapply(smoke$Premature, smoke$marital2, mean)
+names(marital_t) <- c('married', 'unmarried')
+marital_t
+
+# INC
+# Unclear effect
+inc_t <- tapply(smoke$Premature, smoke$inc, mean)
+names(inc_t) <- c('< 2500', '2500 - 4999', '5000 - 7499', '7500 - 9999', 
+                  '10000 - 12499', '12500 - 14999', '15000 - 17499', '17500 - 19999',
+                  '20000 - 22499', '22500+')
+inc_t
+
+# PARITY
+# Potentially an association with 7+ parity and premature births
+tapply(smoke$Premature, smoke$parity2, mean)
+
+
+# CONTINUOUS VARIABLES
+
+par(mfrow = c(2,2))
+# MAGE
+# Potentially a quadratic effect, but unclear
+# (Additional of quadtraic age term did not improve model)
+binnedplot(x = smoke$mage, y = smoke$Premature,
+           xlab = 'Mother\'s Age', ylab = 'Premature Cases', 
+           main = 'Binned Mother\'s Age and Premature cases', 
+           cex.main = .8) 
+
+# MHT
+# Potentially a negative linear association
+binnedplot(x = smoke$mht, y = smoke$Premature,
+           xlab = 'Mother\'s Height', ylab = 'Premature Cases', 
+           main = 'Binned Mother\'s Height and Premature cases',
+           cex.main = .8)
+
+# MPREGWT
+# Unclear association
+binnedplot(x = smoke$mpregwt, y = smoke$Premature,
+           xlab = 'Mother\'s Pre-Pregnancy Weight', ylab = 'Premature Cases', 
+           main = 'Binned Mother\'s Pre-Pregnancy Weight and Premature cases', 
+           cex.main = .8)
+```
+
+## Interaction Effects
+
+Thinking specifically about our second research question, "Is there any evidence that the association between smoking and pre-term birth differs by mother's race?", we want to make sure we check for interaction effects between smoking and mother's race. Looking at the results, we see the potential for interaction effects between smoking and mother's race on premature birth. 
+
+
+
+```{r interaction1}
+# SMOKE AND MRACE
+# Potentially interaction effects, specifically different with Asians, but not clear
+# Non-smokers
+Nonsmokers <- tapply(smoke[smoke$smoke == 0, 'Premature'], smoke[smoke$smoke == 0, 'mraceF2'], 
+            mean)
+# Smokers
+Smokers <- tapply(smoke[smoke$smoke == 1, 'Premature'], smoke[smoke$smoke == 1, 'mraceF2'], 
+            mean)
+# Print table
+cbind(Nonsmokers, Smokers) %>%
+    kable()
+```
+
+Given that our primary research question revolves around the effects of smoking, we also considered interaction effects between smoking and other predictors. Of note, we did see indication of what could be an interaction effect between smoking and mother's height. Although there is possible evidence for such an interaction, there is little reason to believe that the effects of smoking on pre-term differ between short and tall mothers. Due to the lack of scientific reasoning behind this effect we do not include it in our model. Nevertheless, it should be noted that the addition of this effect to our final model results in a change of deviance with a p-value of 0.06664. Further research should be done to investigate the association between height and the effect of smoking on pre-term birth.
+
+Beyond these interactions however, we did not find evidence for interaction effects between smoking and any other predictors.
+
+```{r interaction2}
+# SMOKE and MHT
+# Seems to be an interaction effect
+par(mfrow = c(1,2))
+binnedplot(x = smoke[smoke$smoke == 0, 'mht'], y = smoke[smoke$smoke == 0, 'Premature'],
+           xlab = 'Mother\'s Height',
+           ylab = 'Premature Cases',
+           main = 'Non-smoke',
+           ylim = c(-.5,.5))
+binnedplot(x = smoke[smoke$smoke == 1, 'mht'], y = smoke[smoke$smoke == 1, 'Premature'],
+           xlab = 'Mother\'s Height',
+           ylab = 'Premature Cases',
+           main = 'Smoke',
+           ylim = c(-.5,.5))
+```
+
+
+### Checking for Multicolinearity
+
+Before running our model, we created a correlation matrix using the numerical variables in our dataset. Most correlations were not concerning, with the most remarkable being a `r round(cor.test(smoke$parity, smoke$mage)$estimate,3)` correlation between mother's age and parity. However, `r round(cor.test(smoke$parity, smoke$mage)$estimate,3)` is not high enough to lead us to remove either variable from our list of potential predictors. 
+
+Secondly, there could be reason to believe that including both mother's height and weight would introduce effects of mulicollinarity into our model, there is only a `r round(cor.test(smoke$mpregwt, smoke$mht)$estimate,3)` correlation between mother's height and weight. Therefore we are comfortable including both mother's height and weight in our model.
+
+
+## Model Selection
+
+When fitting a model, we work with mean-centered versions of our numerical variables and a median-centered income variable. To make sure we answer our research question, we began fitting our by modeling prematurity on just smoke and race with an interaction effect between the two.
+
+```{r model1}
+# Fit 1
+# Smoke only
+fit1 <- glm(Premature ~ smoke*mraceF, data = smoke, family = binomial)
+summary(fit1)
+# ROC curve
+# Area under the curve: 0.6307
+roc1 <- roc(smoke$Premature, fitted(fit1), plot=T, legacy.axes=T, print.thres="best")
+auc(roc1)
+# Confusion matrix
+threshold <- 0.158
+table(smoke$Premature, fit1$fitted > threshold)
+```
+
+This first model has an area under the curve of `r round(roc1$auc,3)`. Next, we added in all of the additional terms to our model that we are interested in controling for in our model's interpretation.
+
+```{r model2}
+# Fit 2
+# Adding in variables that we want to control for when interpreting findings
+# Mother's age, height, and weight
+fit2 <- glm(Premature ~ smoke*mraceF2 + mageC + mhtC + mpregwtC + parity2 + 
+                med_binF2 + incCF + marital2, 
+            data = smoke, family = binomial)
+#summary(fit2)
+# P value = 0.08414
+anova(fit1, fit2, test= "Chisq")
+# Area under the curve: 0.6677
+roc2 <- roc(smoke$Premature, fitted(fit2))
+auc(roc2)
+
+# Select this as your final model
+smoke_fit_final <- fit2
+summary(smoke_fit_final)
+```
+
+Through a series of modeling fitting, and change in deviance tests, and comparisons of confusion matrices, we methodically tested alternatives to our model until we were satisfied with the result. Not shown are all the models including variables, manipulations, and interaction effects that did not add explain significant predictive power than a model's without such elements.
+
+Again, although addition of an interaction effect between smoke and mother's height resulted in a change in deviance test with a p-value of .0666, the lack of scientific reasoning ultimately led to a selection of final model without this effect.
+
+Ultimately, we model pre-term birth on smoking, mother's race, age, pre-pregnancy weight, height, parity, education, income and marital status. We include interaction effects of smoking and mother's race, smoking and mother's height, and mother's race and height.
+
+
+### Checking Model Assumptions
+
+Looking at the residuals of our model, average residuals compared to predictors are extremely close to zeo. Based on these results, we are confident that our model fit's our assumptions and we are not missing any major patterns in the data or terms in our model.
+
+```{r residuals, fig.height=6}
+# Create raw residuals
+rawres <- smoke$Premature - fitted(smoke_fit_final)
+
+par(mfrow = c(2,2))
+# MAGEC
+binnedplot(x=smoke$mage, y = rawres, 
+           xlab = "Mother's Age Centered", 
+           ylab = "Residuals",
+           main = "Binned residuals vs. Mother's Age")
+# MPREGWT
+binnedplot(x=smoke$mpregwt, y = rawres, 
+           xlab = "Mother's Pre-Pregnancy Weight Centered", 
+           ylab = "Residuals", 
+           main = "Binned residuals vs. Mother's Pre-Pregnancy Wieght ")
+# MHTC
+binnedplot(x=smoke$mht, y = rawres, 
+           xlab = "Mother's Height Centered", 
+           ylab = "Residuals", 
+           main = "Binned residuals vs. Mother's Height")
+# MED
+tapply(rawres, smoke$med_binF, mean)
+# MRACE
+tapply(rawres, smoke$mraceF2, mean)
+# PARITY
+tapply(rawres, smoke$parity2, mean)
+# INC
+tapply(rawres, smoke$inc, mean)
+# MARTAL
+tapply(rawres, smoke$marital2, mean)
+
+```
+
+### Influential Points
+
+Before we finalize our model, we look for potentially influential points.
+
+```{r influential}
+# Calculate leveage and cooks distance for each observation
+leverage <- hatvalues(smoke_fit_final)
+cooks <- cooks.distance(smoke_fit_final)
+
+# Append leverage and cooks to our data
+smoke_leverage <- smoke %>%
+    mutate(leverage, cooks)
+
+# Take a look at the potentially influential points
+smoke_leverage %>%
+    filter(leverage > .15 | cooks > .03)
+```
+
+We can see that the points with the highest leverage or cooks distance in our model are observations from mother's who are primarily Mexican. Unfortunately, our dataset is heavily skewed towards white women, so this is most likely due to a lack of data representing these races. Additionally, several of our highest leverage or cooks distance observations are of very high parity. We are not primarily concerned with modeling pre-term birth at such high parity, thus these are corner cases of our dataset. Finally, we see that many points with the highest leverage or cooks distance have less than high school education. Again, we are not primarily concerned with the effect of less than high school education on the odds of pre-term birth, thus these are corner cases of our dataset. Ultimately, we remain confident that these points do not have a meaningful effect on our model. We select this model as our final model.
+
+
+### Interpretation
+
+```{r model_fit}
+# ROC curve
+roc_final <- roc(smoke$Premature, fitted(smoke_fit_final), plot=T, legacy.axes=T,
+                 print.thres="best")
+
+# Confusion matrix
+threshold <- 0.182
+matrix <- round(prop.table(table(smoke$Premature, smoke_fit_final$fitted > threshold), 1)*100,1)
+table(smoke$Premature, smoke_fit_final$fitted > threshold)
+```
+Our final model has an area under the curve of `r round(roc_final$auc,3)`. Using the suggested threshold of `r threshold`, our model has a sensitivity of `r matrix[2,2]/100` and a specificity of `r 1-(matrix[1,1]/100)`. In other words, our model correctly predicts `r matrix [2,2]`% of premature births and `r matrix [1,1]`% of normal-term births. This is slightly improved from our first model only inlcuding smoking and mother's race with an area under the curve of `r round(roc1$auc,3)`.
+
+
+
+```{r interpret}
+summary(smoke_fit_final)
+# Create table summary table
+coeff <- data.frame(summary(smoke_fit_final)$coefficients[, c(1,2)],
+              confint.default(smoke_fit_final)) %>%
+    `colnames<-`(c('Estimate', 'SE', '2.5%', '97.5%'))
+```
+
+**Intercept**: Babies for a white or mixed race, non-smoking, women of average height and weight, with 0-6 previous pregnancies, with a high school only education, an income between \$7,500 - $9,999 have an estimated `r round(exp(coeff['(Intercept)','Estimate']),3)` odds of pre-term birth (95% CI: `r round(exp(coeff['(Intercept)','2.5%']),3)`, `r round(exp(coeff['(Intercept)','97.5%']),3)`).
+
+**Smoking**: Holding all else constant, for women who have smoked at some point in her life, we estimate the odds of pre-term birth increase by a factor of `r round(exp(coeff['smoke1','Estimate']),2)` (95% CI: `r round(exp(coeff['smoke1','2.5%']),2)`, `r round(exp(coeff['smoke1','97.5%']),2)`). 
+
+**Mother's Race** Our findings suggest the relationship between odds of pre-term birth and mother's race interacts with smoking in the following way: 
+
+```{r race, fig.height=6}
+# Rebase our models so we can discuss the impacts of smoking
+# for each race individually
+# Black
+smoke_black <- smoke %>% 
+    mutate(mraceF2 = factor(mraceF2, levels = c('black', 'white or mixed', 'mexican', 
+                                              'asian')))
+
+smoke_fit_black <- glm(Premature ~ smoke*mraceF2 + mageC + mhtC + mpregwtC + parity2 + 
+                med_binF2 + incCF + marital2,
+            data = smoke_black, family = binomial)
+coeff_black <- data.frame(summary(smoke_fit_black)$coefficients[, c(1,2)],
+                          confint.default(smoke_fit_black)) %>%
+    `colnames<-`(c('Estimate', 'Std.Error', '2.5%', '97.5%'))
+
+# Mexican
+smoke_mex <- smoke %>% 
+    mutate(mraceF2 = factor(mraceF2, levels = c('mexican', 'white or mixed', 'black', 
+                                              'asian')))
+smoke_fit_mex <- glm(Premature ~ smoke*mraceF2 + mageC + mhtC + mpregwtC + parity2 + 
+                med_binF2 + incCF + marital2,
+            data = smoke_mex, family = binomial)
+coeff_mex <- data.frame(summary(smoke_fit_mex)$coefficients[, c(1,2)],
+                          confint.default(smoke_fit_mex)) %>%
+    `colnames<-`(c('Estimate', 'Std.Error', '2.5%', '97.5%'))
+
+# Asian
+smoke_asia <- smoke %>% 
+    mutate(mraceF2 = factor(mraceF2, levels = c('asian', 'white or mixed', 'black', 
+                                              'mexican')))
+smoke_fit_asia <- glm(Premature ~ smoke*mraceF2 + mageC + mhtC + mpregwtC + parity2 + 
+                med_binF2 + incCF + marital2,
+            data = smoke_asia, family = binomial)
+coeff_asia <- data.frame(summary(smoke_fit_asia)$coefficients[, c(1,2)],
+                          confint.default(smoke_fit_asia)) %>%
+    `colnames<-`(c('Estimate', 'Std.Error', '2.5%', '97.5%'))
+
+
+# Create dummy dataset for charting
+newval_race <- data.frame(mhtC = 0,
+                     smoke = rep(c(0,1), 4),
+                     mpregwtC = 0,
+                     mraceF2 = c(rep('white or mixed', 2),
+                                 rep('black', 2),
+                                 rep('asian', 2),
+                                 rep('mexican', 2)),
+                     med_binF2 = 'HS only',
+                     parity2 = '< 7',
+                     mageC = 0,
+                     marital2 = 'married',
+                     incCF = 0) %>%
+    mutate(smoke = as.factor(smoke),
+        mraceF2 = factor(mraceF2, levels = c('white or mixed', 'black', 'mexican', 
+                                              'asian')),
+        parity2 = as.factor(parity2),
+        marital = as.factor(marital2),
+        incCF = as.factor(incCF)) %>%
+    mutate(smokeF = ifelse(smoke == 0, 'Non-smokers', 'Smokers'))
+
+# Predict responses
+predict <- predict.glm(smoke_fit_final, newval_race, interval = 'response', se.fit = TRUE)
+
+# Create confidence interval
+t <- 1.96 ## approx 95% CI
+upr <- predict$fit + (t * predict$se.fit)
+lwr <- predict$fit - (t * predict$se.fit)
+fit <- predict$fit
+
+# Append predictions
+newval_race <- newval_race %>%
+    mutate(fit = exp(fit),
+           lwr = exp(lwr),
+           upr = exp(upr))
+
+# Create estimate plot
+p1 <- newval_race %>%
+    # Cap the odds at 1
+    mutate(fit = ifelse(fit < 1, fit, 1),
+           upr = ifelse(upr < 1, upr, 1),
+           lwr = ifelse(lwr < 1, lwr, 1)) %>%
+    ggplot() +
+    geom_point(mapping = aes(x = smokeF, y = fit, group = mraceF2,
+                                    shape = mraceF2)) + 
+    geom_line(mapping = aes(x = smokeF, y = fit, group = mraceF2)) +
+    labs(subtitle = 'Estimates', shape = 'Mother\'s Race') +
+    ylab('Estiamted Odds of Pre-Term Birth') 
+
+# Create confidence interval plot
+p2 <- newval_race %>%
+    # Cap the odds at 1
+    mutate(fit = ifelse(fit < 1, fit, 1),
+           upr = ifelse(upr < 1, upr, 1),
+           lwr = ifelse(lwr < 1, lwr, 1)) %>%
+    ggplot() +
+    geom_point(mapping = aes(x = smokeF, y = fit, group = mraceF2,
+                                     shape = mraceF2)) + 
+    geom_line(mapping = aes(x = smokeF, y = fit, group = mraceF2,
+                                     shape = mraceF2)) +
+    geom_point(mapping = aes(x = smokeF, y = lwr, group = mraceF2,
+                                     shape = mraceF2, alpha = .1)) + 
+    geom_line(mapping = aes(x = smokeF, y = lwr, group = mraceF2,
+                                     shape = mraceF2, alpha = .1)) +
+    geom_point(mapping = aes(x = smokeF, y = upr, group = mraceF2,
+                                     shape = mraceF2, alpha = .1)) + 
+    geom_line(mapping = aes(x = smokeF, y = upr, group = mraceF2,
+                                     shape = mraceF2, alpha = .1)) + 
+    facet_grid(. ~ mraceF2) +
+    labs(subtitle = 'Confidence Intervals', shape = 'Mother\'s Race', 
+         alpha = 'Confidence Interval') +
+    ylab('Estiamted Odds of Pre-Term Birth') + 
+    ylim(c(0,1))
+
+grid.arrange(p1, p2, 
+             top = 'Interaction effects between smoking and mother\'s race on odds of pre-term birth')
+```
+
+**Mother's Pre-pregnancy Weight**: Holding all else constant, for each additional 10 pounds mothers weighed before pregnancy, we estimate the odds of pre-term birth increase decrease by a factor of `r round(exp(coeff['mpregwtC','Estimate']*10),2)` (95% CI: `r round(exp(coeff['mpregwtC','2.5%']*10),2)`, `r round(exp(coeff['mpregwtC','97.5%']*10),2)`). Given that this confidence interval includes 1, we are not confident that there is a meaningful effect of mother's weight on odds of pre-term birth.
+
+**Mother's Age**: Holding all else constant, for each 5 additional years mothers age we estimate the odds of pre-term birth increase by a factor of `r round(exp(coeff['mageC','Estimate']*5),2)`  (95% CI: `r round(exp(coeff['mageC','2.5%']*5),2)`, `r round(exp(coeff['mageC','97.5%']*5),2)`). Given that this confidence interval includes 1, we are not confident that there is a meaningful effect of mother's age on pre-term birth.
+
+**Mother's Height**: Holding all else constant, for each additional inch in mothers height we estimate the odds of pre-term birth decrease by a factor of `r round(exp(coeff['mhtC','Estimate']),2)`  (95% CI: `r round(exp(coeff['mhtC','2.5%']),2)`, `r round(exp(coeff['mhtC','97.5%']),2)`). Given that this confidence interval includes 1, we are not confident that there is a meaningful effect of mother's age on pre-term birth.
+
+**Parity**: Holding all else constant, if a mothers has had 7 or more previous pregnancies, we estimate the odds of pre-term birth increase by a factor of `r round(exp(coeff['parity27+','Estimate']),2)`  (95% CI: `r round(exp(coeff['parity27+','2.5%']),2)`, `r round(exp(coeff['parity27+','97.5%']),2)`). Given that this confidence interval includes 1, we are not confident that there is a meaningful effect of parity on pre-term birth.
+
+**Marital**: Holding all else constant, if a mothers is unmarried, we estimate the odds of pre-term birth increase by a factor of `r round(exp(coeff['marital2unmarried','Estimate']),2)`  (95% CI: `r round(exp(coeff['marital2unmarried','2.5%']),2)`, `r round(exp(coeff['marital2unmarried','97.5%']),2)`). Given that this confidence interval includes 1, we are not confident that there is a meaningful effect of parity on pre-term birth.
+
+
+**Education** Holding all else constant, for a woman with:
+
+* Less than a high school education, we estimate the odds of pre-term birth increase by
+`r round(exp(coeff['med_binF2< HS','Estimate']),2)` (95% CI: `r round(exp(coeff['med_binF2< HS','2.5%']),2)`, `r round(exp(coeff['med_binF2< HS','97.5%']),2)`). Given that this confidence interval includes 1, we are not confident that there is a meaningful effect.
+
+* Education including either trade school or some college, we estimate the odds of pre-term birth decrease by `r round(exp(coeff['med_binF2HS + trade or some college','Estimate']),2)` (95% CI: `r round(exp(coeff['med_binF2HS + trade or some college','2.5%']),2)`, `r round(exp(coeff['med_binF2HS + trade or some college','97.5%']),2)`).
+
+* College education, we estimate the odds of pre-term birth decrease by `r round(exp(coeff['med_binF2college','Estimate']),2)` (95% CI: `r round(exp(coeff['med_binF2college','2.5%']),2)`, `r round(exp(coeff['med_binF2college','97.5%']),2)`). Given that this confidence interval includes 1, we are not confident that there is a meaningful effect.
+
+
+### Conclusion
+
+Thinking back to our original research questions. In general, our findings suggest, that smoking increases a mother's odds of pre-term birth. However, our findings also suggest that the effect of smoking on odds of pre-term birth differ by race. Specifically,
+
+* White or mixed race women who smoke are estimated to have the odds of pre-term birth increased by a factor of `r round(exp(coeff['smoke1','Estimate']),2)` (95% CI: `r round(exp(coeff['smoke1','2.5%']),2)`, `r round(exp(coeff['smoke1','97.5%']),2)`) comparied to White women who don't smoke.
+
+* Black women who smoke are estimated to have the odds of pre-term birth decreased by a factor of
+`r round(exp(coeff_black['smoke1','Estimate']),2)` (95% CI: `r round(exp(coeff_black['smoke1','2.5%']),2)`, `r round(exp(coeff_black['smoke1','97.5%']),2)`) comparied to Black women who don't smoke. Given that this confidence interval includes 1, we are not confident that there is a meaningful effect.
+
+* Asian women who smoke are estimated to have the odds of pre-term birth increased by a factor of `r round(exp(coeff_asia['smoke1','Estimate']),2)` (95% CI: `r round(exp(coeff_asia['smoke1','2.5%']),2)`, `r round(exp(coeff_asia['smoke1','97.5%']),2)`) compared to Asian women who don't smoke.  Given that this confidence interval includes 1, we are not confident that there is a meaningful effect.
+
+* Mexican women who smoke are estimated to have the odds of pre-term birth decreased by a factor of `r round(exp(coeff_mex['smoke1','Estimate']),2)` (95% CI: `r round(exp(coeff_mex['smoke1','2.5%']),2)`, `r round(exp(coeff_mex['smoke1','97.5%']),2)`) compared to Mexican women who don't smoke. Given that this confidence interval includes 0, we are not confident that there is a meaningful difference.
+
+The most unique of these cases are found in Black women, for which our estimates suggest that smoking might actually have be associated with decreased odds of pre-term birth. However, it should be noted that Black  women only accounted for `r round(sum(smoke$mraceF == 'black')/nrow(smoke)*100,1)`% of our dataset respectively (`r sum(smoke$mraceF == 'black')`. Furthermore, our confidence intervals for this coefficient included 1, therefore we are not confident that this relationship is significant. Additional research is needed to understand the relationship between smoking and birth weight in Mexican women.
+
+Interestingly, our findings also suggest, in Mexican women, smoking has almost no impact on odds of pre-term birth. Again, it should be noted that Mexican women only accounted for `r round(sum(smoke$mraceF == 'mexican')/nrow(smoke)*100,1)`% of our dataset respectively (`r sum(smoke$mraceF == 'mexican')`. Such low sample sizes contributed to large confidence intervals.
+
+Finally, our findings also suggest that smoking may have heavier effects on birth weight in Asian and compared to White or Multiracial women. In other words, smoking may be associated with higher increased odds of pre-term birth in Asian women compared to White or Multiracial women. Again, it should be noted that Asian women only accounted for `r round(sum(smoke$mraceF == 'asian')/nrow(smoke)*100,1)`% of our dataset (`r sum(smoke$mraceF2 == 'asian')` observations. Therefore additional research is needed to understand the strength of the relationship between smoking and birth weight in a diverse population of women.
+
+Beyond smoking and race there are very few variables that appear to have a significant impact on the odds of pre-term birth. There are several factors of variables may have a "statistically significant"" effect on the odds of pre-term birth, such as having an education including trade school or some college for example. However, it's not clear whether these are reflective of true associations, or merely an effect of limited sample size.
+
+## Limitations
+
+Our final model has an area under the curve of `r round(roc_final$auc,3)`. Using the suggested threshold of `r threshold`, our model has a sensitivity of `r matrix[2,2]/100` and a specificity of `r 1-(matrix[1,1]/100)`. In other words, our model correctly identifies `r matrix [2,2]`% of true premature births and `r matrix [1,1]`% of true normal-term births. It seems that we are missing variables in our model that would explain additional variation in pre-term birth cases, therefore more research is needed to fully understand the relationship between smoking and birth weight and the mediating variables in this relationship.
+
+Additionally, the data included in this study was heavily weighted towards White mothers. Our research suggests that the effect of smoking on birth weight may differ by race, but to be truly confident in these findings, further research should be done on the effect of smoking on birth weights in minorities. Beyond diversification in race, our dataset was also lacking in unmarried mothers and mothers with educations other that high school only and college. To fully understand the effects of these variables, additional data and research is needed.
+
+Additionally, this data was collected as an observational study. To fully understand the causal nature of the relationship between smoking and birth weight, a randomized control trial is needed.
+
+
