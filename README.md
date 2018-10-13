@@ -25,6 +25,6 @@ Our questions of interest include the following.
 * Are there other interesting associations with the odds of pre-term birth that are worth mentioning?
 
 Files included:
-* Methods and Data Analysis #4.Rmd: Model and findings and summary in Rmarkdown
-* Methods and Data Analysis #4.pdf: Model and findings and summary in pdf format
+* Method and Data Analysis #4.Rmd: Model and findings and summary in Rmarkdown
+* Method and Data Analysis #4.pdf: Model and findings and summary in pdf format
 * babiesdata.csv: Data used in report
